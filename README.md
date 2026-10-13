@@ -21,6 +21,10 @@
 - 🌌 **Zero-Leak Profile Isolation**: Transparently sandboxes environments by managing isolated user homes at `~/.agx/<instance-name>`.
 - 🕹️ **Full Interactive PTY**: Powered by `portable-pty` & `crossterm` with raw mode passthrough, real-time terminal resize tracking, and interactive ANSI handling.
 - 🚀 **Streamlined Flag Mapping**: Shorthand `-d` auto-expands to `--dangerously-skip-permissions` for frictionless execution.
+- 🩺 **Health Check & Ping (`agx ping` & `agx <instance> ping`)**:
+  - Probes instances via validation prompts (`agy --prompt "whats between 1 and 3"`).
+  - Measures round-trip latency and diagnoses auth errors or connectivity issues.
+  - Formats results into a clean, colored status table.
 - 📊 **Real-time Quota Dashboard (`agx usage`)**:
   - Queries quotas concurrently across all configured profiles.
   - Parses native `json` data structures (`gemini-weekly`, `5h`, `3p-weekly`, etc.).
@@ -56,7 +60,9 @@ USAGE:
     agx <instance-name> [args...]    Run agy with HOME=~/.agx/<instance-name>
     agx <instance-name> enable       Enable a previously disabled instance
     agx <instance-name> disable      Disable an instance from runs & quota checks
+    agx <instance-name> ping         Ping instance to check health
     agx usage                        Display usage quotas for all instances
+    agx ping                         Ping all instances to check health
     agx add <instance-name>          Create a new instance environment
     agx list                         List all configured instances
     agx --help, -h                   Show this help message
@@ -130,6 +136,33 @@ Fetching usage for 2 instance(s)...
 │ Gemini Models                 │ Five Hour Limit Remaining │     2     │           99% │ [███████████████]│
 │ Claude and GPT models         │ Weekly Limit Remaining    │     2     │          100% │ [███████████████]│
 ╰───────────────────────────────┴───────────────────────────┴───────────┴───────────────┴──────────────────╯
+```
+
+### 5. Fleet & Instance Health Check (`ping`)
+
+Ping all accounts concurrently or target a single instance to verify responsive connectivity and authentication status:
+
+```bash
+# Ping all configured instances
+agx ping
+
+# Ping a single specific instance
+agx work ping
+```
+
+#### Output Preview:
+```text
+Pinging 3 instance(s)...
+
+╭──────────┬──────────────┬─────────┬──────────────────────────────────╮
+│ Instance │ Status       │ Latency │ Response / Message               │
+├──────────┼──────────────┼─────────┼──────────────────────────────────┤
+│ work     │ ● Healthy    │   1.84s │ **2** (or the word "and").       │
+│ personal │ ● Healthy    │   2.10s │ **2** (as an integer).           │
+│ client-a │ ● Disabled   │       - │ -                                │
+╰──────────┴──────────────┴─────────┴──────────────────────────────────╯
+
+Summary: 2 healthy, 0 unhealthy, 1 disabled (Total: 3)
 ```
 
 ---

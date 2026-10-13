@@ -15,9 +15,22 @@ use crossterm::terminal;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
 fn get_home_dir() -> Result<PathBuf> {
-    env::var_os("HOME")
+    if let Some(orig) = env::var_os("AGX_ORIGINAL_HOME") {
+        return Ok(PathBuf::from(orig));
+    }
+    let home = env::var_os("HOME")
         .map(PathBuf::from)
-        .context("Could not determine user HOME directory from environment")
+        .context("Could not determine user HOME directory from environment")?;
+    if !home.join(".agx").exists() {
+        if let Some(parent) = home.parent() {
+            if parent.file_name().and_then(|s| s.to_str()) == Some(".agx") {
+                if let Some(grandparent) = parent.parent() {
+                    return Ok(grandparent.to_path_buf());
+                }
+            }
+        }
+    }
+    Ok(home)
 }
 
 fn get_agx_root() -> Result<PathBuf> {
@@ -632,6 +645,301 @@ fn handle_usage() -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HealthStatus {
+    Healthy,
+    Unhealthy,
+    Disabled,
+}
+
+#[derive(Debug, Clone)]
+struct PingResult {
+    instance_name: String,
+    status: HealthStatus,
+    latency: Option<std::time::Duration>,
+    message: String,
+}
+
+fn ping_instance(instance_name: &str, check_disabled: bool) -> PingResult {
+    if check_disabled && is_instance_disabled(instance_name).unwrap_or(false) {
+        return PingResult {
+            instance_name: instance_name.to_string(),
+            status: HealthStatus::Disabled,
+            latency: None,
+            message: "-".to_string(),
+        };
+    }
+
+    let instance_dir = match get_instance_dir(instance_name) {
+        Ok(dir) => dir,
+        Err(err) => {
+            return PingResult {
+                instance_name: instance_name.to_string(),
+                status: HealthStatus::Unhealthy,
+                latency: None,
+                message: format!("Dir error: {:#}", err),
+            };
+        }
+    };
+
+    if !instance_dir.exists() {
+        return PingResult {
+            instance_name: instance_name.to_string(),
+            status: HealthStatus::Unhealthy,
+            latency: None,
+            message: "Instance directory does not exist".to_string(),
+        };
+    }
+
+    let start = std::time::Instant::now();
+    let child_res = Command::new("agy")
+        .arg("--prompt")
+        .arg("whats between 1 and 3")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .env("HOME", &instance_dir)
+        .spawn();
+
+    let mut child = match child_res {
+        Ok(c) => c,
+        Err(err) => {
+            return PingResult {
+                instance_name: instance_name.to_string(),
+                status: HealthStatus::Unhealthy,
+                latency: None,
+                message: format!("Failed to spawn agy: {:#}", err),
+            };
+        }
+    };
+
+    let timeout = std::time::Duration::from_secs(60);
+    let poll_interval = std::time::Duration::from_millis(100);
+    let mut waited = std::time::Duration::ZERO;
+
+    let exit_status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if waited >= timeout {
+                    let _ = child.kill();
+                    break None;
+                }
+                thread::sleep(poll_interval);
+                waited += poll_interval;
+            }
+            Err(_) => {
+                let _ = child.kill();
+                break None;
+            }
+        }
+    };
+
+    let duration = start.elapsed();
+
+    let mut stdout_str = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_string(&mut stdout_str);
+    }
+    let mut stderr_str = String::new();
+    if let Some(mut err) = child.stderr.take() {
+        let _ = err.read_to_string(&mut stderr_str);
+    }
+
+    let exit_status = match exit_status {
+        Some(s) => s,
+        None => {
+            return PingResult {
+                instance_name: instance_name.to_string(),
+                status: HealthStatus::Unhealthy,
+                latency: Some(duration),
+                message: "Timed out waiting for response (60s)".to_string(),
+            };
+        }
+    };
+
+    let combined = format!("{}\n{}", stdout_str, stderr_str);
+    let trimmed_stdout = stdout_str.trim();
+
+    let is_auth_error = combined.contains("Authentication required")
+        || combined.contains("Waiting for authentication")
+        || combined.contains("Unauthorized")
+        || combined.contains("Please visit the URL to log in");
+
+    if !exit_status.success() || is_auth_error {
+        let mut err_msg = if is_auth_error {
+            "Authentication required".to_string()
+        } else {
+            let err_first_line = stderr_str
+                .lines()
+                .chain(stdout_str.lines())
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .unwrap_or("Process failed without output");
+            format!("Exit code {}: {}", exit_status, err_first_line)
+        };
+        if err_msg.len() > 60 {
+            err_msg = format!("{}...", &err_msg[..57]);
+        }
+        return PingResult {
+            instance_name: instance_name.to_string(),
+            status: HealthStatus::Unhealthy,
+            latency: Some(duration),
+            message: err_msg,
+        };
+    }
+
+    if trimmed_stdout.is_empty() {
+        return PingResult {
+            instance_name: instance_name.to_string(),
+            status: HealthStatus::Unhealthy,
+            latency: Some(duration),
+            message: "No output received from agy".to_string(),
+        };
+    }
+
+    let response_preview = trimmed_stdout
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or(trimmed_stdout);
+
+    let clean_preview = if response_preview.len() > 60 {
+        format!("{}...", &response_preview[..57])
+    } else {
+        response_preview.to_string()
+    };
+
+    PingResult {
+        instance_name: instance_name.to_string(),
+        status: HealthStatus::Healthy,
+        latency: Some(duration),
+        message: clean_preview,
+    }
+}
+
+fn render_ping_table(results: &[PingResult]) {
+    let mut table = Table::new();
+    table
+        .load_style(UTF8_FULL.with_rounded_corners())
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec![
+            Cell::new("Instance").fg(Color::Cyan),
+            Cell::new("Status").fg(Color::Cyan),
+            Cell::new("Latency").fg(Color::Cyan),
+            Cell::new("Response / Message").fg(Color::Cyan),
+        ]);
+
+    let mut healthy_count = 0;
+    let mut unhealthy_count = 0;
+    let mut disabled_count = 0;
+
+    for res in results {
+        let (status_cell, latency_cell, msg_cell) = match res.status {
+            HealthStatus::Healthy => {
+                healthy_count += 1;
+                let lat_str = res
+                    .latency
+                    .map(|d| format!("{:.2}s", d.as_secs_f64()))
+                    .unwrap_or_else(|| "-".to_string());
+                (
+                    Cell::new("● Healthy").fg(Color::Green),
+                    Cell::new(lat_str).set_alignment(CellAlignment::Right).fg(Color::Green),
+                    Cell::new(&res.message).fg(Color::White),
+                )
+            }
+            HealthStatus::Unhealthy => {
+                unhealthy_count += 1;
+                let lat_str = res
+                    .latency
+                    .map(|d| format!("{:.2}s", d.as_secs_f64()))
+                    .unwrap_or_else(|| "-".to_string());
+                (
+                    Cell::new("● Unhealthy").fg(Color::Red),
+                    Cell::new(lat_str).set_alignment(CellAlignment::Right).fg(Color::Red),
+                    Cell::new(&res.message).fg(Color::DarkGrey),
+                )
+            }
+            HealthStatus::Disabled => {
+                disabled_count += 1;
+                (
+                    Cell::new("● Disabled").fg(Color::DarkGrey),
+                    Cell::new("-").set_alignment(CellAlignment::Center).fg(Color::DarkGrey),
+                    Cell::new("-").set_alignment(CellAlignment::Center).fg(Color::DarkGrey),
+                )
+            }
+        };
+
+        table.add_row(vec![
+            Cell::new(&res.instance_name).fg(Color::White),
+            status_cell,
+            latency_cell,
+            msg_cell,
+        ]);
+    }
+
+    println!("\n{}", table);
+
+    if results.len() > 1 {
+        println!(
+            "\nSummary: {} healthy, {} unhealthy, {} disabled (Total: {})",
+            healthy_count, unhealthy_count, disabled_count, results.len()
+        );
+    }
+}
+
+fn handle_ping_instance(instance_name: &str) -> Result<()> {
+    if instance_name.is_empty() || instance_name.contains('/') || instance_name.contains('\\') {
+        bail!("Invalid instance name: '{}'", instance_name);
+    }
+    let instance_dir = get_instance_dir(instance_name)?;
+    if !instance_dir.exists() {
+        bail!("Instance '{}' does not exist at {}", instance_name, instance_dir.display());
+    }
+
+    let is_disabled = is_instance_disabled(instance_name).unwrap_or(false);
+    if is_disabled {
+        println!("Pinging instance '{}' (currently disabled)...", instance_name);
+    } else {
+        println!("Pinging instance '{}'...", instance_name);
+    }
+
+    let mut res = ping_instance(instance_name, false);
+    if is_disabled {
+        res.instance_name = format!("{} (disabled)", res.instance_name);
+    }
+
+    render_ping_table(&[res]);
+    Ok(())
+}
+
+fn handle_ping_all() -> Result<()> {
+    let instances = get_all_instances()?;
+    if instances.is_empty() {
+        let agx_root = get_agx_root()?;
+        println!("No instances found in {}. Run 'agx add <name>' first.", agx_root.display());
+        return Ok(());
+    }
+
+    println!("Pinging {} instance(s)...", instances.len());
+
+    let mut handles = Vec::new();
+    for inst in instances {
+        handles.push(thread::spawn(move || ping_instance(&inst, true)));
+    }
+
+    let mut results = Vec::new();
+    for handle in handles {
+        if let Ok(res) = handle.join() {
+            results.push(res);
+        }
+    }
+    results.sort_by(|a, b| a.instance_name.cmp(&b.instance_name));
+
+    render_ping_table(&results);
+    Ok(())
+}
+
 struct RawModeGuard;
 
 impl RawModeGuard {
@@ -693,6 +1001,9 @@ fn handle_run(instance_name: &str, raw_args: &[String]) -> Result<u32> {
 
     // Set isolated HOME directory
     cmd.env("HOME", &instance_dir);
+    if let Ok(home) = get_home_dir() {
+        cmd.env("AGX_ORIGINAL_HOME", home);
+    }
 
     // Spawn process in PTY slave
     let mut child = pair.slave.spawn_command(cmd).context("Failed to spawn 'agy'. Is 'agy' installed and available in PATH?")?;
@@ -784,7 +1095,9 @@ USAGE:
     agx <instance-name> [args...]    Run agy with HOME=~/.agx/<instance-name>
     agx <instance-name> enable       Enable a previously disabled instance
     agx <instance-name> disable      Disable an instance from runs & quota checks
+    agx <instance-name> ping         Ping instance to check health
     agx usage                        Display usage quotas for all instances
+    agx ping                         Ping all instances to check health
     agx add <instance-name>          Create a new instance environment
     agx list                         List all configured instances
     agx --help, -h                   Show this help message
@@ -795,6 +1108,8 @@ OPTIONS FOR RUN:
 
 EXAMPLES:
     agx usage                        Show beautiful usage tables across all accounts
+    agx ping                         Ping and check health across all accounts
+    agx work ping                    Ping and check health of the 'work' account
     agx work                         Run agy inside ~/.agx/work
     agx work -d                      Run agy with --dangerously-skip-permissions
     agx work disable                 Disable the 'work' account
@@ -821,6 +1136,18 @@ fn main() -> ExitCode {
         }
         "usage" => {
             if let Err(err) = handle_usage() {
+                eprintln!("Error: {:#}", err);
+                return ExitCode::from(1);
+            }
+            ExitCode::SUCCESS
+        }
+        "ping" => {
+            let res = if args.len() >= 2 {
+                handle_ping_instance(&args[1])
+            } else {
+                handle_ping_all()
+            };
+            if let Err(err) = res {
                 eprintln!("Error: {:#}", err);
                 return ExitCode::from(1);
             }
@@ -854,6 +1181,13 @@ fn main() -> ExitCode {
             }
             if args.len() == 2 && args[1] == "disable" {
                 if let Err(err) = handle_disable(instance_name) {
+                    eprintln!("Error: {:#}", err);
+                    return ExitCode::from(1);
+                }
+                return ExitCode::SUCCESS;
+            }
+            if args.len() == 2 && args[1] == "ping" {
+                if let Err(err) = handle_ping_instance(instance_name) {
                     eprintln!("Error: {:#}", err);
                     return ExitCode::from(1);
                 }
@@ -944,5 +1278,17 @@ Claude and GPT models  Five Hour Limit Remaining  100%  2026-10-13 14:04 +0330
         assert_eq!(bar_50, "[█████░░░░░]  50%");
         let bar_0 = render_progress_bar(0, 10);
         assert_eq!(bar_0, "[░░░░░░░░░░]   0%");
+    }
+
+    #[test]
+    fn test_ping_result_structure() {
+        let res = PingResult {
+            instance_name: "ramon".to_string(),
+            status: HealthStatus::Healthy,
+            latency: Some(std::time::Duration::from_millis(1250)),
+            message: "2".to_string(),
+        };
+        assert_eq!(res.status, HealthStatus::Healthy);
+        assert_eq!(res.instance_name, "ramon");
     }
 }
