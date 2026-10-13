@@ -247,7 +247,7 @@ fn parse_iso8601_to_timestamp(s: &str) -> Option<u64> {
     }
 }
 
-/// Formats duration seconds into human relative time e.g. "in 4h 30m" or "in 5d 1h"
+/// Formats duration seconds into compact human relative time e.g. "in 2d 3h 5min", "in 4h 30min", "in 5min"
 fn format_relative_seconds(secs: u64) -> String {
     if secs == 0 {
         return "now".to_string();
@@ -257,40 +257,65 @@ fn format_relative_seconds(secs: u64) -> String {
     let hours = rem / 3600;
     let minutes = (rem % 3600) / 60;
 
+    let mut parts = Vec::new();
     if days > 0 {
-        if hours > 0 {
-            format!("in {}d {}h", days, hours)
-        } else {
-            format!("in {}d", days)
-        }
-    } else if hours > 0 {
-        if minutes > 0 {
-            format!("in {}h {}m", hours, minutes)
-        } else {
-            format!("in {}h", hours)
-        }
-    } else if minutes > 0 {
-        format!("in {}m", minutes)
-    } else {
-        format!("in {}s", secs)
+        parts.push(format!("{}d", days));
     }
+    if hours > 0 {
+        parts.push(format!("{}h", hours));
+    }
+    if minutes > 0 || (days == 0 && hours == 0) {
+        parts.push(format!("{}min", minutes));
+    }
+
+    format!("in {}", parts.join(" "))
 }
 
-/// Extracts or computes human relative time for reset
+/// Computes compact human relative time for reset
+/// Computes compact human relative time for reset
 fn format_human_relative_time(reset_time_str: &str, bucket_desc: Option<&str>) -> Option<String> {
-    // 1. Try extracting from bucket description if available:
-    // e.g. "You have used some of your weekly limit, it will fully refresh in 5 days, 1 hour."
+    // 1. Parse from bucket description if available (e.g. "refresh in 5 days, 1 hour")
     if let Some(desc) = bucket_desc {
         let lower = desc.to_lowercase();
         if let Some(pos) = lower.find("refresh in ") {
-            let extracted = desc[pos + "refresh in ".len()..].trim_end_matches('.');
-            if !extracted.is_empty() {
-                return Some(format!("in {}", extracted));
+            let text = &desc[pos + "refresh in ".len()..];
+            let mut days = 0u64;
+            let mut hours = 0u64;
+            let mut minutes = 0u64;
+
+            for segment in text.split(',') {
+                let s = segment.trim().trim_end_matches('.');
+                let tokens: Vec<&str> = s.split_whitespace().collect();
+                if tokens.len() == 2 {
+                    if let Ok(val) = tokens[0].parse::<u64>() {
+                        if tokens[1].starts_with("day") {
+                            days = val;
+                        } else if tokens[1].starts_with("hour") {
+                            hours = val;
+                        } else if tokens[1].starts_with("min") {
+                            minutes = val;
+                        }
+                    }
+                }
+            }
+
+            let mut parts = Vec::new();
+            if days > 0 {
+                parts.push(format!("{}d", days));
+            }
+            if hours > 0 {
+                parts.push(format!("{}h", hours));
+            }
+            if minutes > 0 || (days == 0 && hours == 0) {
+                parts.push(format!("{}min", minutes));
+            }
+            if !parts.is_empty() {
+                return Some(format!("in {}", parts.join(" ")));
             }
         }
     }
 
-    // 2. Parse ISO timestamp and compare with current system time
+    // 2. Fallback: Parse ISO timestamp and compare with current system time
     if let Some(target_ts) = parse_iso8601_to_timestamp(reset_time_str) {
         if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
             let now_ts = now.as_secs();
@@ -552,7 +577,7 @@ fn handle_usage() -> Result<()> {
             let bar = render_progress_bar(m.remaining_pct, 14);
 
             let reset_display = match &m.human_reset {
-                Some(human) => format!("{} ({})", human, m.reset_time),
+                Some(human) => human.clone(),
                 None => m.reset_time.clone(),
             };
 
@@ -899,13 +924,16 @@ Claude and GPT models  Five Hour Limit Remaining  100%  2026-10-13 14:04 +0330
     fn test_human_relative_time() {
         let desc = "You have used some of your weekly limit, it will fully refresh in 5 days, 1 hour.";
         let res = format_human_relative_time("2026-10-18T07:32:48Z", Some(desc));
-        assert_eq!(res, Some("in 5 days, 1 hour".to_string()));
+        assert_eq!(res, Some("in 5d 1h".to_string()));
 
         let dur = format_relative_seconds(3600 * 4 + 60 * 30);
-        assert_eq!(dur, "in 4h 30m");
+        assert_eq!(dur, "in 4h 30min");
 
-        let dur_days = format_relative_seconds(86400 * 3 + 3600 * 2);
-        assert_eq!(dur_days, "in 3d 2h");
+        let dur_days = format_relative_seconds(86400 * 3 + 3600 * 2 + 60 * 5);
+        assert_eq!(dur_days, "in 3d 2h 5min");
+
+        let dur_min = format_relative_seconds(60 * 15);
+        assert_eq!(dur_min, "in 15min");
     }
 
     #[test]
