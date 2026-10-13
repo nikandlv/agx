@@ -19,12 +19,37 @@ jobs:
     outputs:
       new_version: ${{ steps.bump.outputs.new_version }}
       tag_name: ${{ steps.bump.outputs.tag_name }}
+      release_body: ${{ steps.changelog.outputs.release_body }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
+
+      - name: Generate Changelog from Commit Messages
+        id: changelog
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          echo "Previous tag: $PREV_TAG"
+
+          if [ -n "$PREV_TAG" ]; then
+            COMMITS=$(git log "${PREV_TAG}..HEAD" --pretty=format:"* %s (%h)" --no-merges)
+          else
+            COMMITS=$(git log -n 15 --pretty=format:"* %s (%h)" --no-merges)
+          fi
+
+          # Multiline output handling in GitHub Actions
+          {
+            echo "release_body<<EOF"
+            echo "### What's Changed"
+            echo ""
+            echo "$COMMITS"
+            echo ""
+            echo "---"
+            echo "Automated release build for **agx**."
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Auto-bump patch version in Cargo.toml
         id: bump
@@ -75,10 +100,6 @@ jobs:
             target: aarch64-apple-darwin
             binary_name: agx
             asset_name: agx-aarch64-apple-darwin.tar.gz
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            binary_name: agx.exe
-            asset_name: agx-x86_64-pc-windows-msvc.zip
 
     steps:
       - name: Checkout tagged code
@@ -94,17 +115,10 @@ jobs:
       - name: Build target binary
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Package archive (Unix)
-        if: runner.os != 'Windows'
+      - name: Package archive
         run: |
           cd target/${{ matrix.target }}/release
           tar -czvf ../../../${{ matrix.asset_name }} ${{ matrix.binary_name }}
-
-      - name: Package archive (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          cd target/${{ matrix.target }}/release
-          7z a -tzip ../../../${{ matrix.asset_name }} ${{ matrix.binary_name }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -127,9 +141,9 @@ jobs:
         with:
           tag_name: ${{ needs.bump-version.outputs.tag_name }}
           name: Release ${{ needs.bump-version.outputs.tag_name }}
+          body: ${{ needs.bump-version.outputs.release_body }}
           draft: false
           prerelease: false
-          generate_release_notes: true
           files: release-assets/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
