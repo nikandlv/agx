@@ -54,6 +54,8 @@ agx - Multi-account manager & wrapper for agy
 
 USAGE:
     agx <instance-name> [args...]    Run agy with HOME=~/.agx/<instance-name>
+    agx <instance-name> enable       Enable a previously disabled instance
+    agx <instance-name> disable      Disable an instance from runs & quota checks
     agx usage                        Display usage quotas for all instances
     agx add <instance-name>          Create a new instance environment
     agx list                         List all configured instances
@@ -78,17 +80,28 @@ agx work -d
 agx personal chat "explain quantum computing"
 ```
 
-### 2. Manage Profiles
+### 2. Enable / Disable Accounts
+Easily disable an account to prevent accidental runs or quota consumption, or re-enable it at any time:
+
+```bash
+# Temporarily disable an account
+agx client-a disable
+
+# Re-enable the account
+agx client-a enable
+```
+
+### 3. Manage Profiles
 
 ```bash
 # Explicitly initialize an account profile
 agx add client-a
 
-# List all local instances
+# List all local instances (shows (disabled) status next to disabled accounts)
 agx list
 ```
 
-### 3. Fleet-wide Usage Quota Dashboard
+### 4. Fleet-wide Usage Quota Dashboard
 
 ```bash
 agx usage

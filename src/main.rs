@@ -66,6 +66,51 @@ fn handle_add(instance_name: &str) -> Result<()> {
     Ok(())
 }
 
+fn is_instance_disabled(instance_name: &str) -> Result<bool> {
+    let instance_dir = get_instance_dir(instance_name)?;
+    Ok(instance_dir.join(".disabled").exists())
+}
+
+fn handle_enable(instance_name: &str) -> Result<()> {
+    if instance_name.is_empty() || instance_name.contains('/') || instance_name.contains('\\') {
+        bail!("Invalid instance name: '{}'", instance_name);
+    }
+    let instance_dir = get_instance_dir(instance_name)?;
+    if !instance_dir.exists() {
+        bail!("Instance '{}' does not exist at {}", instance_name, instance_dir.display());
+    }
+
+    let disabled_file = instance_dir.join(".disabled");
+    if disabled_file.exists() {
+        fs::remove_file(&disabled_file)
+            .with_context(|| format!("Failed to enable instance '{}'", instance_name))?;
+        println!("Enabled instance '{}'", instance_name);
+    } else {
+        println!("Instance '{}' is already enabled", instance_name);
+    }
+    Ok(())
+}
+
+fn handle_disable(instance_name: &str) -> Result<()> {
+    if instance_name.is_empty() || instance_name.contains('/') || instance_name.contains('\\') {
+        bail!("Invalid instance name: '{}'", instance_name);
+    }
+    let instance_dir = get_instance_dir(instance_name)?;
+    if !instance_dir.exists() {
+        bail!("Instance '{}' does not exist at {}", instance_name, instance_dir.display());
+    }
+
+    let disabled_file = instance_dir.join(".disabled");
+    if !disabled_file.exists() {
+        fs::write(&disabled_file, "")
+            .with_context(|| format!("Failed to disable instance '{}'", instance_name))?;
+        println!("Disabled instance '{}'", instance_name);
+    } else {
+        println!("Instance '{}' is already disabled", instance_name);
+    }
+    Ok(())
+}
+
 fn handle_list() -> Result<()> {
     let instances = get_all_instances()?;
     let agx_root = get_agx_root()?;
@@ -75,7 +120,12 @@ fn handle_list() -> Result<()> {
     } else {
         println!("Available instances:");
         for inst in instances {
-            println!("  - {}", inst);
+            let disabled = is_instance_disabled(&inst).unwrap_or(false);
+            if disabled {
+                println!("  - {} (disabled)", inst);
+            } else {
+                println!("  - {}", inst);
+            }
         }
     }
     Ok(())
@@ -257,6 +307,14 @@ fn parse_text_usage(output_str: &str) -> Vec<QuotaMetric> {
 }
 
 fn query_instance_usage(instance_name: &str) -> InstanceUsage {
+    if is_instance_disabled(instance_name).unwrap_or(false) {
+        return InstanceUsage {
+            instance_name: instance_name.to_string(),
+            metrics: Vec::new(),
+            error: Some("Disabled".to_string()),
+        };
+    }
+
     let instance_dir = match get_instance_dir(instance_name) {
         Ok(dir) => dir,
         Err(err) => {
@@ -353,10 +411,16 @@ fn handle_usage() -> Result<()> {
 
     for res in &results {
         if let Some(err) = &res.error {
+            let (status_col, desc_col) = if err == "Disabled" {
+                (Cell::new("Disabled").fg(Color::DarkGrey), Cell::new("Account disabled with 'agx <name> disable'").fg(Color::DarkGrey))
+            } else {
+                (Cell::new("Error / Offline").fg(Color::Red), Cell::new(err).fg(Color::DarkGrey))
+            };
+
             table.add_row(vec![
                 Cell::new(&res.instance_name).fg(Color::White),
-                Cell::new("Error / Offline").fg(Color::Red),
-                Cell::new(err).fg(Color::DarkGrey),
+                status_col,
+                desc_col,
                 Cell::new("-").set_alignment(CellAlignment::Center),
                 Cell::new("-").set_alignment(CellAlignment::Center),
                 Cell::new("-").set_alignment(CellAlignment::Center),
@@ -451,6 +515,10 @@ fn handle_run(instance_name: &str, raw_args: &[String]) -> Result<u32> {
     }
 
     let instance_dir = get_instance_dir(instance_name)?;
+    if is_instance_disabled(instance_name).unwrap_or(false) {
+        bail!("Instance '{}' is disabled. Re-enable it with: agx {} enable", instance_name, instance_name);
+    }
+
     if !instance_dir.exists() {
         fs::create_dir_all(&instance_dir)
             .with_context(|| format!("Failed to create instance directory {}", instance_dir.display()))?;
@@ -576,6 +644,8 @@ fn print_help() {
 
 USAGE:
     agx <instance-name> [args...]    Run agy with HOME=~/.agx/<instance-name>
+    agx <instance-name> enable       Enable a previously disabled instance
+    agx <instance-name> disable      Disable an instance from runs & quota checks
     agx usage                        Display usage quotas for all instances
     agx add <instance-name>          Create a new instance environment
     agx list                         List all configured instances
@@ -589,6 +659,8 @@ EXAMPLES:
     agx usage                        Show beautiful usage tables across all accounts
     agx work                         Run agy inside ~/.agx/work
     agx work -d                      Run agy with --dangerously-skip-permissions
+    agx work disable                 Disable the 'work' account
+    agx work enable                  Re-enable the 'work' account
     agx work chat "hello world"      Run agy passing arguments
     agx add personal                 Prepare ~/.agx/personal
     agx list                         Show all available instances
@@ -635,6 +707,21 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         instance_name => {
+            if args.len() == 2 && args[1] == "enable" {
+                if let Err(err) = handle_enable(instance_name) {
+                    eprintln!("Error: {:#}", err);
+                    return ExitCode::from(1);
+                }
+                return ExitCode::SUCCESS;
+            }
+            if args.len() == 2 && args[1] == "disable" {
+                if let Err(err) = handle_disable(instance_name) {
+                    eprintln!("Error: {:#}", err);
+                    return ExitCode::from(1);
+                }
+                return ExitCode::SUCCESS;
+            }
+
             let forwarded_args = &args[1..];
             match handle_run(instance_name, forwarded_args) {
                 Ok(code) => ExitCode::from(code as u8),
