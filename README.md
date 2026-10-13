@@ -62,6 +62,8 @@ USAGE:
     agx <instance-name> enable       Enable a previously disabled instance
     agx <instance-name> disable      Disable an instance from runs & quota checks
     agx <instance-name> ping         Ping instance to check health
+    agx <instance-name> keychain     Link/fix system keychain for a specific instance
+    agx keychain [instance-name]     Link/fix system keychain for all (or specific) instances
     agx usage [instance-name]        Display usage quotas for all (or specific) instances
     agx ping [instance-name]         Ping all (or specific) instances to check health
     agx add <instance-name>          Create a new instance environment
@@ -87,7 +89,22 @@ agx work -d
 agx personal chat "explain quantum computing"
 ```
 
-### 2. Enable / Disable Accounts
+### 2. Keychain & Secret Store Linking (`keychain`)
+When sandboxing user homes, CLI tools (like `agy` and underlying credential helpers) expect access to your desktop keychain / secret service storage. `agx` automatically links credential paths on instance creation, and offers the `keychain` command to fix existing instances across platforms:
+- **macOS**: Links `~/Library/Keychains` into `~/.agx/<instance>/Library/Keychains`
+- **Linux (GNOME / Secret Service)**: Links `~/.local/share/keyrings`
+- **Linux (KDE Plasma / KWallet)**: Links `~/.local/share/kwalletd` and `~/.config/kwalletrc`
+
+```bash
+# Link / fix keychain for all configured instances
+agx keychain
+
+# Link / fix keychain for a specific instance
+agx work keychain
+# (or: agx keychain work)
+```
+
+### 3. Enable / Disable Accounts
 Easily disable an account to prevent accidental runs or quota consumption, or re-enable it at any time:
 
 ```bash
@@ -98,17 +115,17 @@ agx client-a disable
 agx client-a enable
 ```
 
-### 3. Manage Profiles
+### 4. Manage Profiles
 
 ```bash
-# Explicitly initialize an account profile
+# Explicitly initialize an account profile (automatically links keychains)
 agx add client-a
 
 # List all local instances (shows (disabled) status next to disabled accounts)
 agx list
 ```
 
-### 4. Usage Quota Dashboard (`usage`)
+### 5. Usage Quota Dashboard (`usage`)
 
 Query quotas across all configured profiles or inspect a specific instance:
 
@@ -146,7 +163,7 @@ Fetching usage for 2 instance(s)...
 ╰───────────────────────────────┴───────────────────────────┴───────────┴───────────────┴──────────────────╯
 ```
 
-### 5. Fleet & Instance Health Check (`ping`)
+### 6. Fleet & Instance Health Check (`ping`)
 
 Ping all accounts concurrently or target a single instance to verify responsive connectivity and authentication status:
 

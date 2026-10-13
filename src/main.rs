@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -64,6 +64,135 @@ fn get_all_instances() -> Result<Vec<String>> {
     Ok(instances)
 }
 
+fn get_keychain_link_targets(home: &Path) -> Vec<(&'static str, PathBuf)> {
+    let mut targets = Vec::new();
+    if cfg!(target_os = "macos") {
+        targets.push(("macOS Keychain", home.join("Library").join("Keychains")));
+    } else if cfg!(target_os = "linux") {
+        // GNOME Keyring and Freedesktop Secret Service standard storage
+        targets.push(("GNOME Keyring", home.join(".local").join("share").join("keyrings")));
+        // KDE KWallet storage
+        targets.push(("KDE KWallet data", home.join(".local").join("share").join("kwalletd")));
+        // KDE KWallet configuration
+        targets.push(("KDE KWallet config", home.join(".config").join("kwalletrc")));
+    }
+    targets
+}
+
+fn link_single_keychain_entry(label: &str, source: &Path, target: &Path) -> Result<bool> {
+    if !source.exists() && !source.is_symlink() {
+        return Ok(false);
+    }
+
+    if target.is_symlink() {
+        if let Ok(dest) = fs::read_link(target) {
+            if dest == source {
+                return Ok(false); // Already correctly linked
+            }
+        }
+        let _ = fs::remove_file(target);
+    } else if target.is_dir() {
+        // If target is an existing directory, we shouldn't overwrite it blindly
+        // unless it's empty, or warn user.
+        return Ok(false);
+    } else if target.exists() {
+        return Ok(false);
+    }
+
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create parent directory {}", parent.display()))?;
+    }
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(source, target).with_context(|| {
+            format!(
+                "Failed to link {} from {} to {}",
+                label,
+                source.display(),
+                target.display()
+            )
+        })?;
+    }
+
+    #[cfg(windows)]
+    {
+        if source.is_dir() {
+            std::os::windows::fs::symlink_dir(source, target)?;
+        } else {
+            std::os::windows::fs::symlink_file(source, target)?;
+        }
+    }
+
+    Ok(true)
+}
+
+fn link_instance_keychain(instance_name: &str, verbose: bool) -> Result<usize> {
+    let home = get_home_dir()?;
+    let instance_dir = get_instance_dir(instance_name)?;
+    let mut linked_count = 0;
+
+    let targets = get_keychain_link_targets(&home);
+    for (label, source) in targets {
+        // Compute relative path from home to source
+        if let Ok(rel) = source.strip_prefix(&home) {
+            let target = instance_dir.join(rel);
+            match link_single_keychain_entry(label, &source, &target) {
+                Ok(true) => {
+                    linked_count += 1;
+                    if verbose {
+                        println!(
+                            "  [+] Linked {} ({} -> {})",
+                            label,
+                            target.display(),
+                            source.display()
+                        );
+                    }
+                }
+                Ok(false) => {
+                    // Either source didn't exist or already linked
+                }
+                Err(err) => {
+                    if verbose {
+                        eprintln!("  [!] Warning linking {}: {:#}", label, err);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(linked_count)
+}
+
+fn handle_keychain(target_instance: Option<&str>) -> Result<()> {
+    let instances = if let Some(inst) = target_instance {
+        let instance_dir = get_instance_dir(inst)?;
+        if !instance_dir.exists() {
+            bail!("Instance '{}' does not exist at {}", inst, instance_dir.display());
+        }
+        vec![inst.to_string()]
+    } else {
+        let all = get_all_instances()?;
+        if all.is_empty() {
+            println!("No instances found.");
+            return Ok(());
+        }
+        all
+    };
+
+    println!("Ensuring keychain symlinks for {} instance(s)...", instances.len());
+    let mut total_linked = 0;
+    for inst in &instances {
+        println!("Checking instance '{}'...", inst);
+        let count = link_instance_keychain(inst, true)?;
+        total_linked += count;
+    }
+
+    println!("Done. Created/updated {} keychain link(s).", total_linked);
+    Ok(())
+}
+
 fn handle_add(instance_name: &str) -> Result<()> {
     if instance_name.is_empty() || instance_name.contains('/') || instance_name.contains('\\') {
         bail!("Invalid instance name: '{}'", instance_name);
@@ -76,6 +205,8 @@ fn handle_add(instance_name: &str) -> Result<()> {
             .with_context(|| format!("Failed to create directory {}", instance_dir.display()))?;
         println!("Created instance '{}' at {}", instance_name, instance_dir.display());
     }
+
+    let _ = link_instance_keychain(instance_name, false);
     Ok(())
 }
 
@@ -994,6 +1125,7 @@ fn handle_run(instance_name: &str, raw_args: &[String]) -> Result<u32> {
     if !instance_dir.exists() {
         fs::create_dir_all(&instance_dir)
             .with_context(|| format!("Failed to create instance directory {}", instance_dir.display()))?;
+        let _ = link_instance_keychain(instance_name, false);
         eprintln!("[agx] Created new instance directory: {}", instance_dir.display());
     }
 
@@ -1128,6 +1260,8 @@ USAGE:
     agx <instance-name> enable       Enable a previously disabled instance
     agx <instance-name> disable      Disable an instance from runs & quota checks
     agx <instance-name> ping         Ping instance to check health
+    agx <instance-name> keychain     Link/fix system keychain for a specific instance
+    agx keychain [instance-name]     Link/fix system keychain for all (or specific) instances
     agx usage [instance-name]        Display usage quotas for all (or specific) instances
     agx ping [instance-name]         Ping all (or specific) instances to check health
     agx add <instance-name>          Create a new instance environment
@@ -1139,6 +1273,8 @@ OPTIONS FOR RUN:
     [args...]                        All other arguments are forwarded directly to agy
 
 EXAMPLES:
+    agx keychain                     Link keychain for all existing instances
+    agx work keychain                Link keychain for the 'work' account
     agx usage                        Show beautiful usage tables across all accounts
     agx work usage                   Show usage quota for the 'work' account
     agx usage work                   Show usage quota for the 'work' account
@@ -1166,6 +1302,18 @@ fn main() -> ExitCode {
     match args[0].as_str() {
         "-h" | "--help" | "help" => {
             print_help();
+            ExitCode::SUCCESS
+        }
+        "keychain" => {
+            let res = if args.len() >= 2 {
+                handle_keychain(Some(&args[1]))
+            } else {
+                handle_keychain(None)
+            };
+            if let Err(err) = res {
+                eprintln!("Error: {:#}", err);
+                return ExitCode::from(1);
+            }
             ExitCode::SUCCESS
         }
         "usage" => {
@@ -1211,6 +1359,13 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         instance_name => {
+            if args.len() == 2 && args[1] == "keychain" {
+                if let Err(err) = handle_keychain(Some(instance_name)) {
+                    eprintln!("Error: {:#}", err);
+                    return ExitCode::from(1);
+                }
+                return ExitCode::SUCCESS;
+            }
             if args.len() == 2 && args[1] == "usage" {
                 if let Err(err) = handle_instance_usage(instance_name) {
                     eprintln!("Error: {:#}", err);
@@ -1346,4 +1501,53 @@ Claude and GPT models  Five Hour Limit Remaining  100%  2026-10-13 14:04 +0330
         assert_eq!(res.status, HealthStatus::Healthy);
         assert_eq!(res.instance_name, "ramon");
     }
+
+    #[test]
+    fn test_get_keychain_link_targets() {
+        let dummy_home = PathBuf::from("/tmp/dummy_home");
+        let targets = get_keychain_link_targets(&dummy_home);
+        if cfg!(target_os = "macos") {
+            assert_eq!(targets.len(), 1);
+            assert_eq!(targets[0].0, "macOS Keychain");
+            assert_eq!(targets[0].1, dummy_home.join("Library/Keychains"));
+        } else if cfg!(target_os = "linux") {
+            assert_eq!(targets.len(), 3);
+            assert_eq!(targets[0].0, "GNOME Keyring");
+            assert_eq!(targets[0].1, dummy_home.join(".local/share/keyrings"));
+            assert_eq!(targets[1].0, "KDE KWallet data");
+            assert_eq!(targets[1].1, dummy_home.join(".local/share/kwalletd"));
+            assert_eq!(targets[2].0, "KDE KWallet config");
+            assert_eq!(targets[2].1, dummy_home.join(".config/kwalletrc"));
+        }
+    }
+
+    #[test]
+    fn test_link_single_keychain_entry() {
+        let temp_dir = std::env::temp_dir().join(format!("agx_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let _ = fs::create_dir_all(&temp_dir);
+
+        let source = temp_dir.join("source_keychain");
+        let target = temp_dir.join("target_instance/keychain");
+
+        // Source doesn't exist yet -> should return false
+        let res = link_single_keychain_entry("test", &source, &target).unwrap();
+        assert!(!res);
+
+        // Create source directory
+        fs::create_dir_all(&source).unwrap();
+
+        // Should link successfully
+        let res = link_single_keychain_entry("test", &source, &target).unwrap();
+        assert!(res);
+        assert!(target.is_symlink());
+        assert_eq!(fs::read_link(&target).unwrap(), source);
+
+        // Running again when already linked -> should return false without error
+        let res2 = link_single_keychain_entry("test", &source, &target).unwrap();
+        assert!(!res2);
+
+        // Cleanup
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
 }
+
