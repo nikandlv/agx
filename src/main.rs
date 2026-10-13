@@ -139,6 +139,7 @@ struct QuotaMetric {
     limit_type: String,
     remaining_pct: u32,
     reset_time: String,
+    human_reset: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -175,6 +176,8 @@ struct AgyQuotaGroup {
 struct AgyQuotaBucket {
     name: String,
     #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
     remaining_fraction: Option<f64>,
     #[serde(default)]
     reset_time: Option<String>,
@@ -204,6 +207,105 @@ fn progress_color(pct: u32) -> Color {
     }
 }
 
+/// Parses ISO-8601 (e.g. "2026-10-18T07:32:48Z") to unix timestamp
+fn parse_iso8601_to_timestamp(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.len() < 19 {
+        return None;
+    }
+    let date_parts: Vec<&str> = s[0..10].split('-').collect();
+    let time_parts: Vec<&str> = s[11..19].split(':').collect();
+    if date_parts.len() != 3 || time_parts.len() != 3 {
+        return None;
+    }
+
+    let year = date_parts[0].parse::<i64>().ok()?;
+    let month = date_parts[1].parse::<i64>().ok()?;
+    let day = date_parts[2].parse::<i64>().ok()?;
+    let hour = time_parts[0].parse::<i64>().ok()?;
+    let min = time_parts[1].parse::<i64>().ok()?;
+    let sec = time_parts[2].parse::<i64>().ok()?;
+
+    if month < 1 || month > 12 || day < 1 || day > 31 {
+        return None;
+    }
+
+    // Days from civil date (algorithm by Howard Hinnant)
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64;
+    let m = if month > 2 { month - 3 } else { month + 9 } as u64;
+    let doy = (153 * m + 2) / 5 + (day as u64) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = (era * 146097) as i64 + doe as i64 - 719468;
+
+    let timestamp = days * 86400 + hour * 3600 + min * 60 + sec;
+    if timestamp >= 0 {
+        Some(timestamp as u64)
+    } else {
+        None
+    }
+}
+
+/// Formats duration seconds into human relative time e.g. "in 4h 30m" or "in 5d 1h"
+fn format_relative_seconds(secs: u64) -> String {
+    if secs == 0 {
+        return "now".to_string();
+    }
+    let days = secs / 86400;
+    let rem = secs % 86400;
+    let hours = rem / 3600;
+    let minutes = (rem % 3600) / 60;
+
+    if days > 0 {
+        if hours > 0 {
+            format!("in {}d {}h", days, hours)
+        } else {
+            format!("in {}d", days)
+        }
+    } else if hours > 0 {
+        if minutes > 0 {
+            format!("in {}h {}m", hours, minutes)
+        } else {
+            format!("in {}h", hours)
+        }
+    } else if minutes > 0 {
+        format!("in {}m", minutes)
+    } else {
+        format!("in {}s", secs)
+    }
+}
+
+/// Extracts or computes human relative time for reset
+fn format_human_relative_time(reset_time_str: &str, bucket_desc: Option<&str>) -> Option<String> {
+    // 1. Try extracting from bucket description if available:
+    // e.g. "You have used some of your weekly limit, it will fully refresh in 5 days, 1 hour."
+    if let Some(desc) = bucket_desc {
+        let lower = desc.to_lowercase();
+        if let Some(pos) = lower.find("refresh in ") {
+            let extracted = desc[pos + "refresh in ".len()..].trim_end_matches('.');
+            if !extracted.is_empty() {
+                return Some(format!("in {}", extracted));
+            }
+        }
+    }
+
+    // 2. Parse ISO timestamp and compare with current system time
+    if let Some(target_ts) = parse_iso8601_to_timestamp(reset_time_str) {
+        if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            let now_ts = now.as_secs();
+            if target_ts > now_ts {
+                let diff = target_ts - now_ts;
+                return Some(format_relative_seconds(diff));
+            } else {
+                return Some("passed".to_string());
+            }
+        }
+    }
+
+    None
+}
+
 fn parse_usage_output(output_str: &str) -> Vec<QuotaMetric> {
     // 1. First attempt to parse as JSON
     if let Ok(json_val) = serde_json::from_str::<AgyUsageResponse>(output_str.trim()) {
@@ -216,12 +318,14 @@ fn parse_usage_output(output_str: &str) -> Vec<QuotaMetric> {
                             Some(frac) => (frac * 100.0).round().clamp(0.0, 100.0) as u32,
                             None => 0,
                         };
-                        let reset_time = bucket.reset_time.unwrap_or_else(|| "-".to_string());
+                        let reset_time = bucket.reset_time.clone().unwrap_or_else(|| "-".to_string());
+                        let human_reset = format_human_relative_time(&reset_time, bucket.description.as_deref());
                         metrics.push(QuotaMetric {
                             model_family: group.name.clone(),
                             limit_type: bucket.name,
                             remaining_pct: pct,
                             reset_time,
+                            human_reset,
                         });
                     }
                 }
@@ -264,11 +368,13 @@ fn parse_text_usage(output_str: &str) -> Vec<QuotaMetric> {
                 } else {
                     "-".to_string()
                 };
+                let human_reset = format_human_relative_time(&reset_time, None);
                 metrics.push(QuotaMetric {
                     model_family,
                     limit_type,
                     remaining_pct: pct,
                     reset_time,
+                    human_reset,
                 });
                 continue;
             }
@@ -291,11 +397,13 @@ fn parse_text_usage(output_str: &str) -> Vec<QuotaMetric> {
                         } else {
                             "-".to_string()
                         };
+                        let human_reset = format_human_relative_time(&reset_time, None);
                         metrics.push(QuotaMetric {
                             model_family,
                             limit_type,
                             remaining_pct: pct,
                             reset_time,
+                            human_reset,
                         });
                         break;
                     }
@@ -443,6 +551,11 @@ fn handle_usage() -> Result<()> {
             let color = progress_color(m.remaining_pct);
             let bar = render_progress_bar(m.remaining_pct, 14);
 
+            let reset_display = match &m.human_reset {
+                Some(human) => format!("{} ({})", human, m.reset_time),
+                None => m.reset_time.clone(),
+            };
+
             table.add_row(vec![
                 inst_col,
                 Cell::new(&m.model_family).fg(Color::Yellow),
@@ -451,7 +564,7 @@ fn handle_usage() -> Result<()> {
                     .fg(color)
                     .set_alignment(CellAlignment::Right),
                 Cell::new(bar).fg(color),
-                Cell::new(&m.reset_time).fg(Color::DarkGrey),
+                Cell::new(reset_display).fg(Color::DarkGrey),
             ]);
         }
     }
@@ -780,6 +893,19 @@ Claude and GPT models  Five Hour Limit Remaining  100%  2026-10-13 14:04 +0330
         assert_eq!(metrics[1].remaining_pct, 98);
         assert_eq!(metrics[2].model_family, "Claude and GPT models");
         assert_eq!(metrics[2].remaining_pct, 100);
+    }
+
+    #[test]
+    fn test_human_relative_time() {
+        let desc = "You have used some of your weekly limit, it will fully refresh in 5 days, 1 hour.";
+        let res = format_human_relative_time("2026-10-18T07:32:48Z", Some(desc));
+        assert_eq!(res, Some("in 5 days, 1 hour".to_string()));
+
+        let dur = format_relative_seconds(3600 * 4 + 60 * 30);
+        assert_eq!(dur, "in 4h 30m");
+
+        let dur_days = format_relative_seconds(86400 * 3 + 3600 * 2);
+        assert_eq!(dur_days, "in 3d 2h");
     }
 
     #[test]
