@@ -260,7 +260,7 @@ fn parse_iso8601_to_timestamp(s: &str) -> Option<u64> {
     }
 }
 
-/// Formats duration seconds into compact human relative time e.g. "in 2d 3h 5min", "in 4h 30min", "in 5min"
+/// Formats duration seconds into compact human relative time e.g. "in 2d 3h 5min 12s", "in 4h 30min 5s", "in 5min 20s", "in 45s"
 fn format_relative_seconds(secs: u64) -> String {
     if secs == 0 {
         return "now".to_string();
@@ -269,6 +269,7 @@ fn format_relative_seconds(secs: u64) -> String {
     let rem = secs % 86400;
     let hours = rem / 3600;
     let minutes = (rem % 3600) / 60;
+    let seconds = rem % 60;
 
     let mut parts = Vec::new();
     if days > 0 {
@@ -277,17 +278,32 @@ fn format_relative_seconds(secs: u64) -> String {
     if hours > 0 {
         parts.push(format!("{}h", hours));
     }
-    if minutes > 0 || (days == 0 && hours == 0) {
+    if minutes > 0 {
         parts.push(format!("{}min", minutes));
+    }
+    if seconds > 0 || (days == 0 && hours == 0 && minutes == 0) {
+        parts.push(format!("{}s", seconds));
     }
 
     format!("in {}", parts.join(" "))
 }
 
-/// Computes compact human relative time for reset
-/// Computes compact human relative time for reset
+/// Computes compact human relative time for reset (including seconds)
 fn format_human_relative_time(reset_time_str: &str, bucket_desc: Option<&str>) -> Option<String> {
-    // 1. Parse from bucket description if available (e.g. "refresh in 5 days, 1 hour")
+    // 1. First prioritize parsing ISO timestamp and comparing with current system time for second-level accuracy
+    if let Some(target_ts) = parse_iso8601_to_timestamp(reset_time_str) {
+        if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            let now_ts = now.as_secs();
+            if target_ts > now_ts {
+                let diff = target_ts - now_ts;
+                return Some(format_relative_seconds(diff));
+            } else {
+                return Some("passed".to_string());
+            }
+        }
+    }
+
+    // 2. Fallback: Parse from bucket description if available (e.g. "refresh in 5 days, 1 hour")
     if let Some(desc) = bucket_desc {
         let lower = desc.to_lowercase();
         if let Some(pos) = lower.find("refresh in ") {
@@ -295,6 +311,7 @@ fn format_human_relative_time(reset_time_str: &str, bucket_desc: Option<&str>) -
             let mut days = 0u64;
             let mut hours = 0u64;
             let mut minutes = 0u64;
+            let mut seconds = 0u64;
 
             for segment in text.split(',') {
                 let s = segment.trim().trim_end_matches('.');
@@ -307,6 +324,8 @@ fn format_human_relative_time(reset_time_str: &str, bucket_desc: Option<&str>) -
                             hours = val;
                         } else if tokens[1].starts_with("min") {
                             minutes = val;
+                        } else if tokens[1].starts_with("sec") {
+                            seconds = val;
                         }
                     }
                 }
@@ -319,24 +338,14 @@ fn format_human_relative_time(reset_time_str: &str, bucket_desc: Option<&str>) -
             if hours > 0 {
                 parts.push(format!("{}h", hours));
             }
-            if minutes > 0 || (days == 0 && hours == 0) {
+            if minutes > 0 {
                 parts.push(format!("{}min", minutes));
+            }
+            if seconds > 0 || (days == 0 && hours == 0 && minutes == 0) {
+                parts.push(format!("{}s", seconds));
             }
             if !parts.is_empty() {
                 return Some(format!("in {}", parts.join(" ")));
-            }
-        }
-    }
-
-    // 2. Fallback: Parse ISO timestamp and compare with current system time
-    if let Some(target_ts) = parse_iso8601_to_timestamp(reset_time_str) {
-        if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-            let now_ts = now.as_secs();
-            if target_ts > now_ts {
-                let diff = target_ts - now_ts;
-                return Some(format_relative_seconds(diff));
-            } else {
-                return Some("passed".to_string());
             }
         }
     }
@@ -516,30 +525,7 @@ fn query_instance_usage(instance_name: &str) -> InstanceUsage {
     }
 }
 
-fn handle_usage() -> Result<()> {
-    let instances = get_all_instances()?;
-    if instances.is_empty() {
-        println!("No instances found in ~/.agx. Run 'agx add <name>' first.");
-        return Ok(());
-    }
-
-    println!("Fetching usage for {} instance(s)...", instances.len());
-
-    // Query in parallel
-    let mut handles = Vec::new();
-    for inst in instances {
-        handles.push(thread::spawn(move || query_instance_usage(&inst)));
-    }
-
-    let mut results = Vec::new();
-    for handle in handles {
-        if let Ok(res) = handle.join() {
-            results.push(res);
-        }
-    }
-    results.sort_by(|a, b| a.instance_name.cmp(&b.instance_name));
-
-    // Construct detailed table
+fn render_usage_tables(results: &[InstanceUsage], show_summary: bool) {
     let mut table = Table::new();
     table
         .load_style(UTF8_FULL.with_rounded_corners())
@@ -555,7 +541,7 @@ fn handle_usage() -> Result<()> {
 
     let mut aggregated: BTreeMap<(String, String), (u64, u32)> = BTreeMap::new(); // (Model, Limit) -> (sum_pct, count)
 
-    for res in &results {
+    for res in results {
         if let Some(err) = &res.error {
             let (status_col, desc_col) = if err == "Disabled" {
                 (Cell::new("Disabled").fg(Color::DarkGrey), Cell::new("-").set_alignment(CellAlignment::Center))
@@ -610,7 +596,7 @@ fn handle_usage() -> Result<()> {
     println!("\n{}", table);
 
     // Render aggregated summary table
-    if !aggregated.is_empty() {
+    if show_summary && !aggregated.is_empty() {
         let mut agg_table = Table::new();
         agg_table
             .load_style(UTF8_FULL.with_rounded_corners())
@@ -641,7 +627,47 @@ fn handle_usage() -> Result<()> {
 
         println!("\n{}", agg_table);
     }
+}
 
+fn handle_usage() -> Result<()> {
+    let instances = get_all_instances()?;
+    if instances.is_empty() {
+        println!("No instances found in ~/.agx. Run 'agx add <name>' first.");
+        return Ok(());
+    }
+
+    println!("Fetching usage for {} instance(s)...", instances.len());
+
+    // Query in parallel
+    let mut handles = Vec::new();
+    for inst in instances {
+        handles.push(thread::spawn(move || query_instance_usage(&inst)));
+    }
+
+    let mut results = Vec::new();
+    for handle in handles {
+        if let Ok(res) = handle.join() {
+            results.push(res);
+        }
+    }
+    results.sort_by(|a, b| a.instance_name.cmp(&b.instance_name));
+
+    render_usage_tables(&results, results.len() > 1);
+    Ok(())
+}
+
+fn handle_instance_usage(instance_name: &str) -> Result<()> {
+    if instance_name.is_empty() || instance_name.contains('/') || instance_name.contains('\\') {
+        bail!("Invalid instance name: '{}'", instance_name);
+    }
+    let instance_dir = get_instance_dir(instance_name)?;
+    if !instance_dir.exists() {
+        bail!("Instance '{}' does not exist at {}", instance_name, instance_dir.display());
+    }
+
+    println!("Fetching usage for instance '{}'...", instance_name);
+    let res = query_instance_usage(instance_name);
+    render_usage_tables(&[res], false);
     Ok(())
 }
 
@@ -999,6 +1025,11 @@ fn handle_run(instance_name: &str, raw_args: &[String]) -> Result<u32> {
         cmd.arg(arg);
     }
 
+    // Set working directory to the current working directory where agx was invoked
+    if let Ok(current_dir) = env::current_dir() {
+        cmd.cwd(current_dir);
+    }
+
     // Set isolated HOME directory
     cmd.env("HOME", &instance_dir);
     if let Ok(home) = get_home_dir() {
@@ -1093,11 +1124,12 @@ fn print_help() {
 
 USAGE:
     agx <instance-name> [args...]    Run agy with HOME=~/.agx/<instance-name>
+    agx <instance-name> usage        Display usage quotas for a specific instance
     agx <instance-name> enable       Enable a previously disabled instance
     agx <instance-name> disable      Disable an instance from runs & quota checks
     agx <instance-name> ping         Ping instance to check health
-    agx usage                        Display usage quotas for all instances
-    agx ping                         Ping all instances to check health
+    agx usage [instance-name]        Display usage quotas for all (or specific) instances
+    agx ping [instance-name]         Ping all (or specific) instances to check health
     agx add <instance-name>          Create a new instance environment
     agx list                         List all configured instances
     agx --help, -h                   Show this help message
@@ -1108,6 +1140,8 @@ OPTIONS FOR RUN:
 
 EXAMPLES:
     agx usage                        Show beautiful usage tables across all accounts
+    agx work usage                   Show usage quota for the 'work' account
+    agx usage work                   Show usage quota for the 'work' account
     agx ping                         Ping and check health across all accounts
     agx work ping                    Ping and check health of the 'work' account
     agx work                         Run agy inside ~/.agx/work
@@ -1135,7 +1169,12 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         "usage" => {
-            if let Err(err) = handle_usage() {
+            let res = if args.len() >= 2 {
+                handle_instance_usage(&args[1])
+            } else {
+                handle_usage()
+            };
+            if let Err(err) = res {
                 eprintln!("Error: {:#}", err);
                 return ExitCode::from(1);
             }
@@ -1172,6 +1211,13 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         instance_name => {
+            if args.len() == 2 && args[1] == "usage" {
+                if let Err(err) = handle_instance_usage(instance_name) {
+                    eprintln!("Error: {:#}", err);
+                    return ExitCode::from(1);
+                }
+                return ExitCode::SUCCESS;
+            }
             if args.len() == 2 && args[1] == "enable" {
                 if let Err(err) = handle_enable(instance_name) {
                     eprintln!("Error: {:#}", err);
@@ -1257,17 +1303,26 @@ Claude and GPT models  Five Hour Limit Remaining  100%  2026-10-13 14:04 +0330
     #[test]
     fn test_human_relative_time() {
         let desc = "You have used some of your weekly limit, it will fully refresh in 5 days, 1 hour.";
-        let res = format_human_relative_time("2026-10-18T07:32:48Z", Some(desc));
+        let res = format_human_relative_time("invalid_ts", Some(desc));
         assert_eq!(res, Some("in 5d 1h".to_string()));
 
-        let dur = format_relative_seconds(3600 * 4 + 60 * 30);
-        assert_eq!(dur, "in 4h 30min");
+        let dur = format_relative_seconds(3600 * 4 + 60 * 30 + 15);
+        assert_eq!(dur, "in 4h 30min 15s");
 
-        let dur_days = format_relative_seconds(86400 * 3 + 3600 * 2 + 60 * 5);
-        assert_eq!(dur_days, "in 3d 2h 5min");
+        let dur_no_sec = format_relative_seconds(3600 * 4 + 60 * 30);
+        assert_eq!(dur_no_sec, "in 4h 30min");
 
-        let dur_min = format_relative_seconds(60 * 15);
-        assert_eq!(dur_min, "in 15min");
+        let dur_days = format_relative_seconds(86400 * 3 + 3600 * 2 + 60 * 5 + 42);
+        assert_eq!(dur_days, "in 3d 2h 5min 42s");
+
+        let dur_min = format_relative_seconds(60 * 15 + 8);
+        assert_eq!(dur_min, "in 15min 8s");
+
+        let dur_sec_only = format_relative_seconds(45);
+        assert_eq!(dur_sec_only, "in 45s");
+
+        let dur_zero = format_relative_seconds(0);
+        assert_eq!(dur_zero, "now");
     }
 
     #[test]

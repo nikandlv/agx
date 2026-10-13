@@ -58,11 +58,12 @@ agx - Multi-account manager & wrapper for agy
 
 USAGE:
     agx <instance-name> [args...]    Run agy with HOME=~/.agx/<instance-name>
+    agx <instance-name> usage        Display usage quotas for a specific instance
     agx <instance-name> enable       Enable a previously disabled instance
     agx <instance-name> disable      Disable an instance from runs & quota checks
     agx <instance-name> ping         Ping instance to check health
-    agx usage                        Display usage quotas for all instances
-    agx ping                         Ping all instances to check health
+    agx usage [instance-name]        Display usage quotas for all (or specific) instances
+    agx ping [instance-name]         Ping all (or specific) instances to check health
     agx add <instance-name>          Create a new instance environment
     agx list                         List all configured instances
     agx --help, -h                   Show this help message
@@ -107,27 +108,34 @@ agx add client-a
 agx list
 ```
 
-### 4. Fleet-wide Usage Quota Dashboard
+### 4. Usage Quota Dashboard (`usage`)
+
+Query quotas across all configured profiles or inspect a specific instance:
 
 ```bash
+# Display quota dashboard across all instances
 agx usage
+
+# Or inspect quotas for a single specific instance
+agx work usage
+# (or: agx usage work)
 ```
 
 #### Output Preview:
 ```text
 Fetching usage for 2 instance(s)...
 
-╭──────────┬───────────────────────┬───────────────────────────┬───────────┬──────────────────────┬─────────────╮
-│ Instance │ Model Family          │ Quota / Limit             │ Remaining │ Progress             │ Resets At   │
-├──────────┼───────────────────────┼───────────────────────────┼───────────┼──────────────────────┼─────────────┤
-│ work     │ Gemini Models         │ Weekly Limit Remaining    │       68% │ [█████████░░░░░] 68% │ in 5d 1h    │
-│          │ Gemini Models         │ Five Hour Limit Remaining │       98% │ [█████████████░] 98% │ in 4h 51min │
-│          │ Claude and GPT models │ Weekly Limit Remaining    │      100% │ [██████████████] 100%│ in 6d 23h   │
-│          │ Claude and GPT models │ Five Hour Limit Remaining │      100% │ [██████████████] 100%│ in 4h 55min │
-├──────────┼───────────────────────┼───────────────────────────┼───────────┼──────────────────────┼─────────────┤
-│ personal │ Gemini Models         │ Weekly Limit Remaining    │       95% │ [█████████████░] 95% │ in 6d 3h    │
-│          │ Gemini Models         │ Five Hour Limit Remaining │      100% │ [██████████████] 100%│ in 1h 28min │
-╰──────────┴───────────────────────┴───────────────────────────┴───────────┴──────────────────────┴─────────────╯
+╭──────────┬───────────────────────┬───────────────────────────┬───────────┬──────────────────────┬────────────────╮
+│ Instance │ Model Family          │ Quota / Limit             │ Remaining │ Progress             │ Resets At      │
+├──────────┼───────────────────────┼───────────────────────────┼───────────┼──────────────────────┼────────────────┤
+│ work     │ Gemini Models         │ Weekly Limit Remaining    │       68% │ [█████████░░░░░] 68% │ in 5d 1h 24s   │
+│          │ Gemini Models         │ Five Hour Limit Remaining │       98% │ [█████████████░] 98% │ in 4h 51min 2s │
+│          │ Claude and GPT models │ Weekly Limit Remaining    │      100% │ [██████████████] 100%│ in 6d 23h      │
+│          │ Claude and GPT models │ Five Hour Limit Remaining │      100% │ [██████████████] 100%│ in 4h 55min 8s │
+├──────────┼───────────────────────┼───────────────────────────┼───────────┼──────────────────────┼────────────────┤
+│ personal │ Gemini Models         │ Weekly Limit Remaining    │       95% │ [█████████████░] 95% │ in 6d 3h       │
+│          │ Gemini Models         │ Five Hour Limit Remaining │      100% │ [██████████████] 100%│ in 1h 28min 1s │
+╰──────────┴───────────────────────┴───────────────────────────┴───────────┴──────────────────────┴────────────────╯
 
 ╭───────────────────────────────┬───────────────────────────┬───────────┬───────────────┬──────────────────╮
 │ Total Aggregated (Average)    │ Quota / Limit             │ Instances │ Avg Remaining │ Progress         │
