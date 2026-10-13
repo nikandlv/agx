@@ -545,7 +545,7 @@ fn handle_usage() -> Result<()> {
     for res in &results {
         if let Some(err) = &res.error {
             let (status_col, desc_col) = if err == "Disabled" {
-                (Cell::new("Disabled").fg(Color::DarkGrey), Cell::new("Account disabled with 'agx <name> disable'").fg(Color::DarkGrey))
+                (Cell::new("Disabled").fg(Color::DarkGrey), Cell::new("-").set_alignment(CellAlignment::Center))
             } else {
                 (Cell::new("Error / Offline").fg(Color::Red), Cell::new(err).fg(Color::DarkGrey))
             };
